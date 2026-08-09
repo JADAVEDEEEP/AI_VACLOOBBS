@@ -1,5 +1,5 @@
 const pool = require("../engine/db");
-const executeWorkflow = require("../actions/workflowEngine");
+const executeWorkflow = require("../actions/triggerWorkflowRun");
 
 const triggerWorkflowRun = async (req, res) => {
   try {
