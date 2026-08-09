@@ -1,31 +1,11 @@
 const pool = require("../engine/db");
 const executeWorkflow = require("../actions/workflowEngine");
-
-const NHOST_AUTH_URL =
-  process.env.NHOST_AUTH_URL ||
-  "https://appdmoluewxkzgifjxlx.auth.ap-south-1.nhost.run";
-
-function decodeJwtPayload(token) {
-  try {
-    const parts = token.split(".");
-
-    if (parts.length !== 3) {
-      return null;
-    }
-
-    return JSON.parse(
-      Buffer.from(parts[1], "base64url").toString("utf8")
-    );
-  } catch (error) {
-    console.error("JWT decode error:", error.message);
-    return null;
-  }
-}
+const jwt = require("jsonwebtoken");
 
 const triggerWorkflowRun = async (req, res) => {
   try {
     // ============================================
-    // 1. Get workflow ID
+    // 1. Workflow ID
     // ============================================
 
     const workflow_id = req.body?.input?.workflow_id;
@@ -38,7 +18,7 @@ const triggerWorkflowRun = async (req, res) => {
     }
 
     // ============================================
-    // 2. Get Bearer token from request
+    // 2. Authorization header
     // ============================================
 
     const authHeader = req.headers.authorization;
@@ -60,72 +40,45 @@ const triggerWorkflowRun = async (req, res) => {
     }
 
     // ============================================
-    // 3. Verify token with Nhost
+    // 3. Decode JWT
     // ============================================
 
-    let verifyResponse;
+    let decodedToken;
 
     try {
-      verifyResponse = await fetch(
-        `${NHOST_AUTH_URL}/v1/token/verify`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            token,
-          }),
-        }
-      );
+      decodedToken = jwt.decode(token);
     } catch (error) {
-      console.error(
-        "Nhost verification request failed:",
-        error.message
-      );
+      console.error("JWT decode error:", error.message);
 
       return res.status(401).json({
         success: false,
-        message: "Unable to verify authentication",
+        message: "Invalid authentication token",
       });
     }
 
-    if (!verifyResponse.ok) {
-      const verifyBody = await verifyResponse.text();
-
-      console.error(
-        "Nhost rejected token:",
-        verifyResponse.status,
-        verifyBody
-      );
-
+    if (!decodedToken) {
       return res.status(401).json({
         success: false,
-        message: "Invalid or expired authentication token",
+        message: "Invalid authentication token",
       });
     }
+
+    console.log("JWT decoded successfully");
 
     // ============================================
-    // 4. Extract user ID from verified JWT
+    // 4. Get user ID
     // ============================================
-
-    const payload = decodeJwtPayload(token);
-
-    if (!payload) {
-      return res.status(401).json({
-        success: false,
-        message: "Unable to read authentication token",
-      });
-    }
 
     const hasuraClaims =
-      payload["https://hasura.io/jwt/claims"];
+      decodedToken["https://hasura.io/jwt/claims"];
 
     const userId =
       hasuraClaims?.["x-hasura-user-id"] ||
-      payload.sub;
+      decodedToken.sub;
 
     if (!userId) {
+      console.error("No user ID in token");
+
       return res.status(401).json({
         success: false,
         message: "User ID not found in authentication token",
@@ -160,7 +113,7 @@ const triggerWorkflowRun = async (req, res) => {
     const workflow = workflowResult.rows[0];
 
     // ============================================
-    // 6. Check organization membership
+    // 6. Organization membership
     // ============================================
 
     const memberResult = await pool.query(
@@ -183,7 +136,7 @@ const triggerWorkflowRun = async (req, res) => {
     const role = memberResult.rows[0].role;
 
     // ============================================
-    // 7. Owner / Editor permission
+    // 7. Permission
     // ============================================
 
     if (!["owner", "editor"].includes(role)) {
@@ -194,7 +147,7 @@ const triggerWorkflowRun = async (req, res) => {
     }
 
     // ============================================
-    // 8. Check quota
+    // 8. Quota
     // ============================================
 
     const orgResult = await pool.query(
@@ -304,10 +257,7 @@ const triggerWorkflowRun = async (req, res) => {
       status: "running",
     });
   } catch (error) {
-    console.error(
-      "Trigger workflow error:",
-      error
-    );
+    console.error("Trigger workflow error:", error);
 
     return res.status(500).json({
       success: false,
