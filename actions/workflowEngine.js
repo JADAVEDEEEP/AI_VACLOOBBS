@@ -1,368 +1,179 @@
 const pool = require("../engine/db");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const executeWorkflow = require("../engine/workflowEngine");
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const triggerWorkflowRun = async (req, res) => {
+  try {
+    // Hasura Action normally sends arguments inside req.body.input
+    const input = req.body?.input || req.body || {};
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const workflow_id = input.workflow_id;
 
-async function executeWithRetry(fn, attempts = 2) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      return await fn(attempt);
-    } catch (error) {
-      lastError = error;
-
-      if (attempt < attempts) {
-        await sleep(1000);
-      }
+    if (!workflow_id) {
+      return res.status(400).json({
+        success: false,
+        message: "workflow_id is required",
+      });
     }
-  }
 
-  throw lastError;
-}
+    // Get user from Hasura session variables
+    const userId =
+      req.body?.session_variables?.["x-hasura-user-id"] ||
+      req.headers["x-user-id"];
 
-async function executeLLM(config, input) {
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.0-flash",
-  });
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "User authentication required",
+      });
+    }
 
-  const prompt = `
-${config.prompt || "Analyze the following input."}
-
-Input:
-${JSON.stringify(input)}
-`;
-
-  const result = await model.generateContent(prompt);
-
-  return {
-    text: result.response.text(),
-  };
-}
-
-async function executeHttp(config, input) {
-  const response = await fetch(config.url, {
-    method: config.method || "GET",
-    headers: {
-      "Content-Type": "application/json",
-      ...(config.headers || {}),
-    },
-    ...(config.method !== "GET"
-      ? {
-          body: JSON.stringify(config.body || input),
-        }
-      : {}),
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP request failed: ${response.status}`);
-  }
-
-  const contentType = response.headers.get("content-type");
-
-  if (contentType?.includes("application/json")) {
-    return await response.json();
-  }
-
-  return await response.text();
-}
-
-async function executeConditional(config, input) {
-  const value = input?.[config.field];
-
-  const condition =
-    config.operator === "equals"
-      ? value === config.value
-      : config.operator === "contains"
-      ? String(value || "")
-          .toLowerCase()
-          .includes(String(config.value || "").toLowerCase())
-      : false;
-
-  return {
-    condition,
-    branch: condition ? "true" : "false",
-  };
-}
-
-async function executeDbWrite(config, input, runId) {
-  await pool.query(
-    `
-    INSERT INTO workflow_data
-    (
-      org_id,
-      workflow_id,
-      workflow_run_id,
-      key,
-      value
-    )
-    VALUES ($1, $2, $3, $4, $5)
-    `,
-    [
-      config.org_id,
-      config.workflow_id,
-      runId,
-      config.key || "workflow_result",
-      JSON.stringify(input),
-    ]
-  );
-
-  return {
-    saved: true,
-  };
-}
-
-async function executeNotify(config, input) {
-  console.log("NOTIFICATION:", {
-    message: config.message,
-    input,
-  });
-
-  return {
-    notified: true,
-  };
-}
-
-async function executeWorkflow(runId, startPosition = 0) {
-  const runResult = await pool.query(
-    `
-    SELECT
-      wr.id,
-      wr.workflow_id
-    FROM workflow_runs wr
-    WHERE wr.id = $1
-    `,
-    [runId]
-  );
-
-  if (!runResult.rows.length) {
-    throw new Error("Workflow run not found");
-  }
-
-  const run = runResult.rows[0];
-
-  const stepsResult = await pool.query(
-    `
-    SELECT *
-    FROM workflow_steps
-    WHERE workflow_id = $1
-    ORDER BY position ASC
-    `,
-    [run.workflow_id]
-  );
-
-  const steps = stepsResult.rows;
-
-  let previousOutput = null;
-
-  // Resume case: get output from the last completed step
-  if (startPosition > 0) {
-    const previousStepResult = await pool.query(
+    // 1. Get workflow + organization
+    const workflowResult = await pool.query(
       `
-      SELECT sr.output
-      FROM step_runs sr
-      JOIN workflow_steps ws
-        ON ws.id = sr.workflow_step_id
-      WHERE sr.workflow_run_id = $1
-        AND ws.position < $2
-        AND sr.status = 'completed'
-      ORDER BY ws.position DESC
-      LIMIT 1
+      SELECT
+        w.id,
+        w.org_id,
+        w.name
+      FROM workflows w
+      WHERE w.id = $1
       `,
-      [runId, startPosition]
+      [workflow_id]
     );
 
-    if (previousStepResult.rows.length) {
-      previousOutput = previousStepResult.rows[0].output;
-    }
-  }
-
-  for (const step of steps) {
-    // Skip already completed steps during resume
-    if (step.position < startPosition) {
-      continue;
+    if (workflowResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Workflow not found",
+      });
     }
 
-    // Create step run
-    const stepRunResult = await pool.query(
+    const workflow = workflowResult.rows[0];
+
+    // 2. Check organization membership
+    const memberResult = await pool.query(
       `
-      INSERT INTO step_runs
+      SELECT role
+      FROM org_members
+      WHERE org_id = $1
+        AND user_id = $2
+      `,
+      [workflow.org_id, userId]
+    );
+
+    if (memberResult.rows.length === 0) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not a member of this organization",
+      });
+    }
+
+    const role = memberResult.rows[0].role;
+
+    // 3. Only owner/editor can trigger
+    if (!["owner", "editor"].includes(role)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only owner/editor can trigger workflow",
+      });
+    }
+
+    // 4. Check quota
+    const orgResult = await pool.query(
+      `
+      SELECT
+        quota_used,
+        quota_allowed
+      FROM organizations
+      WHERE id = $1
+      `,
+      [workflow.org_id]
+    );
+
+    if (orgResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Organization not found",
+      });
+    }
+
+    const organization = orgResult.rows[0];
+
+    if (
+      organization.quota_used >=
+      organization.quota_allowed
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Organization quota exhausted",
+      });
+    }
+
+    // 5. Create workflow run
+    const runResult = await pool.query(
+      `
+      INSERT INTO workflow_runs
       (
-        workflow_run_id,
-        workflow_step_id,
+        workflow_id,
         status,
-        input,
-        attempt_count,
+        triggered_by,
+        trigger_type,
         started_at
       )
       VALUES
-      ($1, $2, 'running', $3, 1, NOW())
-      RETURNING id
+      ($1, 'running', $2, 'manual', NOW())
+      RETURNING *
       `,
-      [
-        runId,
-        step.id,
-        JSON.stringify(previousOutput),
-      ]
+      [workflow_id, userId]
     );
 
-    const stepRunId = stepRunResult.rows[0].id;
+    const run = runResult.rows[0];
 
-    try {
-      let output;
-
-      // LLM
-      if (step.type === "llm_call") {
-        output = await executeWithRetry(
-          () => executeLLM(step.config, previousOutput),
-          2
-        );
-      }
-
-      // HTTP
-      else if (step.type === "http_request") {
-        output = await executeWithRetry(
-          () => executeHttp(step.config, previousOutput),
-          2
-        );
-      }
-
-      // CONDITIONAL
-      else if (step.type === "conditional_branch") {
-        output = await executeConditional(
-          step.config,
-          previousOutput
-        );
-      }
-
-      // DB WRITE
-      else if (step.type === "db_write") {
-        output = await executeDbWrite(
-          {
-            ...step.config,
-            org_id: step.config.org_id,
-            workflow_id: run.workflow_id,
-          },
-          previousOutput,
-          runId
-        );
-      }
-
-      // NOTIFY
-      else if (step.type === "notify") {
-        output = await executeNotify(
-          step.config,
-          previousOutput
-        );
-      }
-
-      // APPROVAL GATE
-      else if (step.type === "approval_gate") {
-        await pool.query(
-          `
-          UPDATE step_runs
-          SET status = 'paused'
-          WHERE id = $1
-          `,
-          [stepRunId]
-        );
-
-        await pool.query(
-          `
-          UPDATE workflow_runs
-          SET status = 'paused'
-          WHERE id = $1
-          `,
-          [runId]
-        );
-
+    // 6. Start workflow engine
+    // Do not wait here so the Action can immediately return
+    executeWorkflow(run.id)
+      .then(async (result) => {
         console.log(
-          `Workflow ${runId} paused for approval`
+          `Workflow ${run.id} finished with status: ${result.status}`
         );
 
-        return {
-          status: "paused",
-          runId,
-          stepRunId,
-          position: step.position,
-        };
-      }
-
-      else {
-        throw new Error(
-          `Unsupported step type: ${step.type}`
+        // Increment quota only after successful completion
+        if (result.status === "completed") {
+          await pool.query(
+            `
+            UPDATE organizations
+            SET quota_used = quota_used + 1
+            WHERE id = $1
+            `,
+            [workflow.org_id]
+          );
+        }
+      })
+      .catch((error) => {
+        console.error(
+          `Workflow ${run.id} execution failed:`,
+          error.message
         );
-      }
+      });
 
-      // Save successful step
-      await pool.query(
-        `
-        UPDATE step_runs
-        SET
-          status = 'completed',
-          output = $1,
-          completed_at = NOW()
-        WHERE id = $2
-        `,
-        [
-          JSON.stringify(output),
-          stepRunId,
-        ]
-      );
+    // 7. Immediately return run information
+    return res.status(201).json({
+      success: true,
+      message: "Workflow run started",
+      run_id: run.id,
+      status: "running",
+    });
 
-      previousOutput = output;
-    } catch (error) {
-      console.error(
-        `Step ${step.id} failed:`,
-        error.message
-      );
+  } catch (error) {
+    console.error(
+      "Trigger workflow error:",
+      error
+    );
 
-      await pool.query(
-        `
-        UPDATE step_runs
-        SET
-          status = 'failed',
-          error = $1,
-          completed_at = NOW()
-        WHERE id = $2
-        `,
-        [error.message, stepRunId]
-      );
-
-      await pool.query(
-        `
-        UPDATE workflow_runs
-        SET
-          status = 'failed',
-          error = $1,
-          completed_at = NOW()
-        WHERE id = $2
-        `,
-        [error.message, runId]
-      );
-
-      throw error;
-    }
+    return res.status(500).json({
+      success: false,
+      message: "Failed to trigger workflow",
+    });
   }
+};
 
-  // Workflow completed
-  await pool.query(
-    `
-    UPDATE workflow_runs
-    SET
-      status = 'completed',
-      completed_at = NOW()
-    WHERE id = $1
-    `,
-    [runId]
-  );
-
-  return {
-    status: "completed",
-    runId,
-  };
-}
-
-module.exports = executeWorkflow;
+module.exports = triggerWorkflowRun;
