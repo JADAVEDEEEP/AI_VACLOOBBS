@@ -1,8 +1,10 @@
 const pool = require("../engine/db");
+const executeWorkflow = require("../actions/workflowEngine");
 
 const triggerWorkflowRun = async (req, res) => {
   try {
-    const { workflow_id } = req.body;
+    // Hasura Action payload
+    const workflow_id = req.body?.input?.workflow_id;
 
     if (!workflow_id) {
       return res.status(400).json({
@@ -11,8 +13,9 @@ const triggerWorkflowRun = async (req, res) => {
       });
     }
 
-    // Temporary: later this will come from Hasura session variables
-    const userId = req.headers["x-user-id"];
+    // Get logged-in user from Hasura session variables
+    const userId =
+      req.body?.session_variables?.["x-hasura-user-id"];
 
     if (!userId) {
       return res.status(401).json({
@@ -81,9 +84,19 @@ const triggerWorkflowRun = async (req, res) => {
       [workflow.org_id]
     );
 
+    if (orgResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Organization not found",
+      });
+    }
+
     const organization = orgResult.rows[0];
 
-    if (organization.quota_used >= organization.quota_allowed) {
+    if (
+      Number(organization.quota_used) >=
+      Number(organization.quota_allowed)
+    ) {
       return res.status(403).json({
         success: false,
         message: "Organization quota exhausted",
@@ -110,21 +123,60 @@ const triggerWorkflowRun = async (req, res) => {
 
     const run = runResult.rows[0];
 
-    // 6. Start engine
-    // We'll connect workflowEngine here next.
+    // 6. Increment quota
+    await pool.query(
+      `
+      UPDATE organizations
+      SET quota_used = quota_used + 1
+      WHERE id = $1
+      `,
+      [workflow.org_id]
+    );
+
+    // 7. Start workflow engine
+    executeWorkflow(run.id).catch(async (error) => {
+      console.error(
+        "Workflow execution failed:",
+        error.message
+      );
+
+      try {
+        await pool.query(
+          `
+          UPDATE workflow_runs
+          SET
+            status = 'failed',
+            error = $1,
+            completed_at = NOW()
+          WHERE id = $2
+          `,
+          [error.message, run.id]
+        );
+      } catch (dbError) {
+        console.error(
+          "Failed to update workflow run:",
+          dbError.message
+        );
+      }
+    });
 
     return res.status(201).json({
       success: true,
       message: "Workflow run started",
-      run,
+      run_id: run.id,
+      status: "running",
     });
 
   } catch (error) {
-    console.error("Trigger workflow error:", error);
+    console.error(
+      "Trigger workflow error:",
+      error
+    );
 
     return res.status(500).json({
       success: false,
       message: "Failed to trigger workflow",
+      error: error.message,
     });
   }
 };
