@@ -1,9 +1,44 @@
 const pool = require("../engine/db");
 const executeWorkflow = require("../actions/workflowEngine");
 
+const NHOST_AUTH_URL =
+  process.env.NHOST_AUTH_URL ||
+  "https://appdmoluewxkzgifjxlx.auth.ap-south-1.nhost.run";
+
+function getUserIdFromToken(token) {
+  try {
+    const parts = token.split(".");
+
+    if (parts.length !== 3) {
+      return null;
+    }
+
+    // Decode JWT payload after the token has been
+    // verified by Nhost.
+    const payload = JSON.parse(
+      Buffer.from(parts[1], "base64url").toString("utf8")
+    );
+
+    const hasuraClaims =
+      payload["https://hasura.io/jwt/claims"];
+
+    return (
+      hasuraClaims?.["x-hasura-user-id"] ||
+      payload.sub ||
+      null
+    );
+  } catch (error) {
+    console.error("Failed to decode token:", error.message);
+    return null;
+  }
+}
+
 const triggerWorkflowRun = async (req, res) => {
   try {
-    // Hasura Action payload
+    // =====================================================
+    // 1. Get workflow ID from frontend request
+    // =====================================================
+
     const workflow_id = req.body?.input?.workflow_id;
 
     if (!workflow_id) {
@@ -13,18 +48,89 @@ const triggerWorkflowRun = async (req, res) => {
       });
     }
 
-    // Get logged-in user from Hasura session variables
-    const userId =
-      req.body?.session_variables?.["x-hasura-user-id"];
+    // =====================================================
+    // 2. Get Bearer token from Authorization header
+    // =====================================================
 
-    if (!userId) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({
         success: false,
         message: "User authentication required",
       });
     }
 
-    // 1. Get workflow + organization
+    const token = authHeader.substring("Bearer ".length).trim();
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "User authentication required",
+      });
+    }
+
+    // =====================================================
+    // 3. Verify token with Nhost
+    // =====================================================
+
+    try {
+      const verifyResponse = await fetch(
+        `${NHOST_AUTH_URL}/v1/token/verify`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      if (!verifyResponse.ok) {
+        const verifyError = await verifyResponse.text();
+
+        console.error(
+          "Nhost token verification failed:",
+          verifyResponse.status,
+          verifyError
+        );
+
+        return res.status(401).json({
+          success: false,
+          message: "Invalid or expired authentication token",
+        });
+      }
+    } catch (authError) {
+      console.error(
+        "Nhost authentication request failed:",
+        authError.message
+      );
+
+      return res.status(401).json({
+        success: false,
+        message: "Unable to verify authentication",
+      });
+    }
+
+    // =====================================================
+    // 4. Extract authenticated user ID
+    // =====================================================
+
+    const userId = getUserIdFromToken(token);
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "User ID not found in authentication token",
+      });
+    }
+
+    console.log("Authenticated user:", userId);
+
+    // =====================================================
+    // 5. Get workflow + organization
+    // =====================================================
+
     const workflowResult = await pool.query(
       `
       SELECT
@@ -46,13 +152,16 @@ const triggerWorkflowRun = async (req, res) => {
 
     const workflow = workflowResult.rows[0];
 
-    // 2. Check organization membership
+    // =====================================================
+    // 6. Check organization membership
+    // =====================================================
+
     const memberResult = await pool.query(
       `
       SELECT role
       FROM org_members
       WHERE org_id = $1
-      AND user_id = $2
+        AND user_id = $2
       `,
       [workflow.org_id, userId]
     );
@@ -66,7 +175,10 @@ const triggerWorkflowRun = async (req, res) => {
 
     const role = memberResult.rows[0].role;
 
-    // 3. Only owner/editor can trigger
+    // =====================================================
+    // 7. Only owner/editor can trigger workflow
+    // =====================================================
+
     if (!["owner", "editor"].includes(role)) {
       return res.status(403).json({
         success: false,
@@ -74,10 +186,15 @@ const triggerWorkflowRun = async (req, res) => {
       });
     }
 
-    // 4. Check quota
+    // =====================================================
+    // 8. Check organization quota
+    // =====================================================
+
     const orgResult = await pool.query(
       `
-      SELECT quota_used, quota_allowed
+      SELECT
+        quota_used,
+        quota_allowed
       FROM organizations
       WHERE id = $1
       `,
@@ -103,7 +220,10 @@ const triggerWorkflowRun = async (req, res) => {
       });
     }
 
-    // 5. Create workflow run
+    // =====================================================
+    // 9. Create workflow run
+    // =====================================================
+
     const runResult = await pool.query(
       `
       INSERT INTO workflow_runs
@@ -123,7 +243,10 @@ const triggerWorkflowRun = async (req, res) => {
 
     const run = runResult.rows[0];
 
-    // 6. Increment quota
+    // =====================================================
+    // 10. Increment organization quota
+    // =====================================================
+
     await pool.query(
       `
       UPDATE organizations
@@ -133,7 +256,10 @@ const triggerWorkflowRun = async (req, res) => {
       [workflow.org_id]
     );
 
-    // 7. Start workflow engine
+    // =====================================================
+    // 11. Start workflow engine
+    // =====================================================
+
     executeWorkflow(run.id).catch(async (error) => {
       console.error(
         "Workflow execution failed:",
@@ -160,13 +286,16 @@ const triggerWorkflowRun = async (req, res) => {
       }
     });
 
+    // =====================================================
+    // 12. Return success
+    // =====================================================
+
     return res.status(201).json({
       success: true,
       message: "Workflow run started",
       run_id: run.id,
       status: "running",
     });
-
   } catch (error) {
     console.error(
       "Trigger workflow error:",
