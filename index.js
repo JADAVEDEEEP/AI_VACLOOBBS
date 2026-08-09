@@ -1,5 +1,6 @@
 require("dotenv").config();
-
+const triggerWorkflowRun = require("./actions/triggerWorkflowRun");
+const approveStep = require("./actions/approveStep");
 const express = require("express");
 const cors = require("cors");
 const pool = require("./engine/db");
@@ -9,6 +10,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.post("/actions/triggerWorkflowRun", triggerWorkflowRun);
+app.post("/actions/approveStep", approveStep);
 app.get("/health", (req, res) => {
   res.json({
     success: true,
