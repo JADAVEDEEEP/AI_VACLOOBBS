@@ -32,9 +32,8 @@ async function executeLLM(config, input) {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is not configured");
   }
-
-  const model = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
+const model = genAI.getGenerativeModel({
+  model: "gemini-3.5-flash-lite",
 });
   const prompt = `
 ${config?.prompt || "Analyze the following input."}
